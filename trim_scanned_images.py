@@ -68,25 +68,83 @@ def _first_content_col(
     return -1
 
 
-def detect_trim_box(image: Image.Image, margin: int = 2) -> tuple[int, int, int, int]:
+def _edge_white_ratio_row(
+    pixels, left: int, right: int, y: int, white_threshold: int
+) -> float:
+    width = right - left + 1
+    white_count = 0
+    for x in range(left, right + 1):
+        if pixels[x, y] >= white_threshold:
+            white_count += 1
+    return white_count / width
+
+
+def _edge_white_ratio_col(
+    pixels, top: int, bottom: int, x: int, white_threshold: int
+) -> float:
+    height = bottom - top + 1
+    white_count = 0
+    for y in range(top, bottom + 1):
+        if pixels[x, y] >= white_threshold:
+            white_count += 1
+    return white_count / height
+
+
+def _shrink_white_edges(
+    gray: Image.Image, left: int, top: int, right: int, bottom: int, white_threshold: int
+) -> tuple[int, int, int, int]:
+    """Remove remaining 1px-level white lines from all edges."""
+    pixels = gray.load()
+    white_ratio_threshold = 0.995
+
+    while left < right and top < bottom:
+        changed = False
+
+        width = right - left + 1
+        height = bottom - top + 1
+
+        if height > 2 and _edge_white_ratio_row(pixels, left, right, top, white_threshold) >= white_ratio_threshold:
+            top += 1
+            changed = True
+
+        if height > 2 and _edge_white_ratio_row(pixels, left, right, bottom, white_threshold) >= white_ratio_threshold:
+            bottom -= 1
+            changed = True
+
+        if width > 2 and _edge_white_ratio_col(pixels, top, bottom, left, white_threshold) >= white_ratio_threshold:
+            left += 1
+            changed = True
+
+        if width > 2 and _edge_white_ratio_col(pixels, top, bottom, right, white_threshold) >= white_ratio_threshold:
+            right -= 1
+            changed = True
+
+        if not changed:
+            break
+
+    return left, top, right, bottom
+
+
+def detect_trim_box(image: Image.Image) -> tuple[int, int, int, int]:
     """Return PIL crop box (left, top, right, bottom) for visible scanned/photo region.
 
-    This version aggressively removes outer white margins by scanning from each edge and
-    selecting the first row/column that has enough non-white pixels.
+    1) Find initial box by scanning inward for non-white content.
+    2) Repeatedly shave off near-all-white outer lines to eliminate residual white edges.
     """
     gray = image.convert("L")
     width, height = gray.size
     pixels = gray.load()
 
     hist = gray.histogram()
-    # White paper/background is generally concentrated in the high percentiles.
     p98 = percentile_from_histogram(hist, 98)
     p90 = percentile_from_histogram(hist, 90)
-    # Pixel values below this threshold are treated as "content" (non-white).
     darkness_threshold = min(250, max(200, (p90 + p98) // 2))
 
-    # At least ~0.7% dark pixels required in an edge row/column to be considered content.
-    min_ratio = 0.007
+    # For edge cleanup, treat very bright pixels as white.
+    p99 = percentile_from_histogram(hist, 99)
+    white_threshold = max(245, p99 - 2)
+
+    min_ratio = 0.005
 
     top = _first_content_row(pixels, width, 0, height, 1, darkness_threshold, min_ratio)
     bottom = _first_content_row(pixels, width, height - 1, -1, -1, darkness_threshold, min_ratio)
@@ -96,10 +154,9 @@ def detect_trim_box(image: Image.Image, margin: int = 2) -> tuple[int, int, int,
     if min(top, bottom, left, right) < 0 or left >= right or top >= bottom:
         return (0, 0, width, height)
 
-    left = max(0, left - margin)
-    top = max(0, top - margin)
-    right = min(width - 1, right + margin)
-    bottom = min(height - 1, bottom + margin)
+    left, top, right, bottom = _shrink_white_edges(
+        gray, left=left, top=top, right=right, bottom=bottom, white_threshold=white_threshold
+    )
 
     return (left, top, right + 1, bottom + 1)
 
