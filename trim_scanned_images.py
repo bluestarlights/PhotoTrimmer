@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 from pathlib import Path
+from statistics import median
 from typing import Iterable
 
 from PIL import Image
@@ -25,97 +26,105 @@ def iter_images(input_dir: Path) -> Iterable[Path]:
             yield path
 
 
-def percentile_from_histogram(hist: list[int], percentile: float) -> int:
-    """Return intensity value for percentile in [0, 100] from 256-bin grayscale histogram."""
-    total = sum(hist)
-    if total == 0:
-        return 0
+def _sample_border_pixels(rgb: Image.Image, strip: int = 8) -> list[tuple[int, int, int]]:
+    """Collect RGB pixels from image borders to estimate paper/background color."""
+    width, height = rgb.size
+    px = rgb.load()
+    strip = max(1, min(strip, width // 4 if width >= 4 else 1, height // 4 if height >= 4 else 1))
 
-    threshold_count = max(1, int(total * (percentile / 100.0)))
-    running = 0
-    for value, count in enumerate(hist):
-        running += count
-        if running >= threshold_count:
-            return value
-    return 255
+    samples: list[tuple[int, int, int]] = []
 
-
-def _first_content_row(
-    pixels, width: int, start: int, stop: int, step: int, darkness_threshold: int, min_ratio: float
-) -> int:
-    min_dark_pixels = max(1, int(width * min_ratio))
-    for y in range(start, stop, step):
-        dark_count = 0
+    # Top / bottom strips
+    for y in range(strip):
         for x in range(width):
-            if pixels[x, y] < darkness_threshold:
-                dark_count += 1
-                if dark_count >= min_dark_pixels:
-                    return y
-    return -1
+            samples.append(px[x, y])
+            samples.append(px[x, height - 1 - y])
 
-
-def _first_content_col(
-    pixels, height: int, start: int, stop: int, step: int, darkness_threshold: int, min_ratio: float
-) -> int:
-    min_dark_pixels = max(1, int(height * min_ratio))
-    for x in range(start, stop, step):
-        dark_count = 0
+    # Left / right strips
+    for x in range(strip):
         for y in range(height):
-            if pixels[x, y] < darkness_threshold:
-                dark_count += 1
-                if dark_count >= min_dark_pixels:
-                    return x
-    return -1
+            samples.append(px[x, y])
+            samples.append(px[width - 1 - x, y])
+
+    return samples
 
 
-def _edge_white_ratio_row(
-    pixels, left: int, right: int, y: int, white_threshold: int
-) -> float:
-    width = right - left + 1
-    white_count = 0
-    for x in range(left, right + 1):
-        if pixels[x, y] >= white_threshold:
-            white_count += 1
-    return white_count / width
+def _estimate_background_color(rgb: Image.Image) -> tuple[int, int, int]:
+    """Estimate dominant border background color via per-channel median."""
+    border_pixels = _sample_border_pixels(rgb)
+    r = int(median(p[0] for p in border_pixels))
+    g = int(median(p[1] for p in border_pixels))
+    b = int(median(p[2] for p in border_pixels))
+    return r, g, b
 
 
-def _edge_white_ratio_col(
-    pixels, top: int, bottom: int, x: int, white_threshold: int
-) -> float:
-    height = bottom - top + 1
-    white_count = 0
-    for y in range(top, bottom + 1):
-        if pixels[x, y] >= white_threshold:
-            white_count += 1
-    return white_count / height
+def _content_bbox_from_background(rgb: Image.Image, bg: tuple[int, int, int]) -> tuple[int, int, int, int] | None:
+    """Return bounding box of non-background pixels using color-distance threshold."""
+    width, height = rgb.size
+    px = rgb.load()
+
+    # Adaptive threshold: higher for bright paper scans, lower for darker backgrounds.
+    bg_luma = (bg[0] * 299 + bg[1] * 587 + bg[2] * 114) // 1000
+    tolerance = 18 if bg_luma < 200 else 24
+
+    left, top = width, height
+    right, bottom = -1, -1
+
+    for y in range(height):
+        for x in range(width):
+            pr, pg, pb = px[x, y]
+            dist = abs(pr - bg[0]) + abs(pg - bg[1]) + abs(pb - bg[2])
+            if dist > tolerance:
+                if x < left:
+                    left = x
+                if y < top:
+                    top = y
+                if x > right:
+                    right = x
+                if y > bottom:
+                    bottom = y
+
+    if right < left or bottom < top:
+        return None
+    return left, top, right, bottom
 
 
-def _shrink_white_edges(
-    gray: Image.Image, left: int, top: int, right: int, bottom: int, white_threshold: int
-) -> tuple[int, int, int, int]:
-    """Remove remaining 1px-level white lines from all edges."""
-    pixels = gray.load()
-    white_ratio_threshold = 0.995
+def _trim_residual_white_edges(rgb: Image.Image, box: tuple[int, int, int, int]) -> tuple[int, int, int, int]:
+    """Iteratively shave off mostly-white border rows/cols from a candidate crop box."""
+    px = rgb.load()
+    left, top, right, bottom = box
+
+    def row_white_ratio(y: int, l: int, r: int) -> float:
+        white = 0
+        total = r - l + 1
+        for x in range(l, r + 1):
+            rr, gg, bb = px[x, y]
+            if rr >= 245 and gg >= 245 and bb >= 245:
+                white += 1
+        return white / total
+
+    def col_white_ratio(x: int, t: int, b: int) -> float:
+        white = 0
+        total = b - t + 1
+        for y in range(t, b + 1):
+            rr, gg, bb = px[x, y]
+            if rr >= 245 and gg >= 245 and bb >= 245:
+                white += 1
+        return white / total
 
     while left < right and top < bottom:
         changed = False
-
-        width = right - left + 1
-        height = bottom - top + 1
-
-        if height > 2 and _edge_white_ratio_row(pixels, left, right, top, white_threshold) >= white_ratio_threshold:
+        # Aggressive values to remove remaining white lines on bottom/right too.
+        if row_white_ratio(top, left, right) >= 0.992 and (bottom - top) > 2:
             top += 1
             changed = True
-
-        if height > 2 and _edge_white_ratio_row(pixels, left, right, bottom, white_threshold) >= white_ratio_threshold:
+        if row_white_ratio(bottom, left, right) >= 0.992 and (bottom - top) > 2:
             bottom -= 1
             changed = True
-
-        if width > 2 and _edge_white_ratio_col(pixels, top, bottom, left, white_threshold) >= white_ratio_threshold:
+        if col_white_ratio(left, top, bottom) >= 0.992 and (right - left) > 2:
             left += 1
             changed = True
-
-        if width > 2 and _edge_white_ratio_col(pixels, top, bottom, right, white_threshold) >= white_ratio_threshold:
+        if col_white_ratio(right, top, bottom) >= 0.992 and (right - left) > 2:
             right -= 1
             changed = True
 
@@ -126,37 +135,25 @@ def _shrink_white_edges(
 
 
 def detect_trim_box(image: Image.Image) -> tuple[int, int, int, int]:
-    """Return PIL crop box (left, top, right, bottom) for visible scanned/photo region.
+    """Return PIL crop box (left, top, right, bottom exclusive) for content region.
 
-    1) Find initial box by scanning inward for non-white content.
-    2) Repeatedly shave off near-all-white outer lines to eliminate residual white edges.
+    Strategy:
+    1) Estimate background from border pixels.
+    2) Build content bbox from color distance to background.
+    3) Remove residual near-white 1px lines from all edges.
     """
-    gray = image.convert("L")
-    width, height = gray.size
-    pixels = gray.load()
+    rgb = image.convert("RGB")
+    width, height = rgb.size
 
-    hist = gray.histogram()
-    p98 = percentile_from_histogram(hist, 98)
-    p90 = percentile_from_histogram(hist, 90)
-    darkness_threshold = min(250, max(200, (p90 + p98) // 2))
-
-    # For edge cleanup, treat very bright pixels as white.
-    p99 = percentile_from_histogram(hist, 99)
-    white_threshold = max(245, p99 - 2)
-
-    min_ratio = 0.005
-
-    top = _first_content_row(pixels, width, 0, height, 1, darkness_threshold, min_ratio)
-    bottom = _first_content_row(pixels, width, height - 1, -1, -1, darkness_threshold, min_ratio)
-    left = _first_content_col(pixels, height, 0, width, 1, darkness_threshold, min_ratio)
-    right = _first_content_col(pixels, height, width - 1, -1, -1, darkness_threshold, min_ratio)
-
-    if min(top, bottom, left, right) < 0 or left >= right or top >= bottom:
+    bg = _estimate_background_color(rgb)
+    initial_box = _content_bbox_from_background(rgb, bg)
+    if initial_box is None:
         return (0, 0, width, height)
 
-    left, top, right, bottom = _shrink_white_edges(
-        gray, left=left, top=top, right=right, bottom=bottom, white_threshold=white_threshold
-    )
+    left, top, right, bottom = _trim_residual_white_edges(rgb, initial_box)
+
+    if left >= right or top >= bottom:
+        return (0, 0, width, height)
 
     return (left, top, right + 1, bottom + 1)
 
